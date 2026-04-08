@@ -1,0 +1,1 @@
+LineName,Bus0,Bus1,Bus0_Name,Bus1_Name,Circuit,Conductor,Branch_Name,Latitude_Center,Longitude_Center,Line_Length_km,Azimuth_deg,Tilt_deg,Timestamp,AirTemp_C,WindSpeed_mps,WindDir_deg,Pressure_Pa,Humidity_percent,CloudCover,Global_Tilted_Irradiance_Wm2,Solar_Azimuth_deg,Solar_Elevation_deg,Effective_Solar_Irradiance_Wm2

@@ -1,0 +1,537 @@
+"""
+Transmission Line Weather & Solar Data Collector
+For IEEE-738 Dynamic Line Rating Calculations
+"""
+
+from settings import *
+
+# =============================================================================
+# CONFIGURATION AND SETUP
+# =============================================================================
+
+# Load bus and line data
+df_buses = pd.read_csv("data/buses.csv")
+df_lines = pd.read_csv("data/lines.csv")
+
+# CSV output setup
+csv_file = "data/honolulu_all_lines_weather_comprehensive.csv"
+fieldnames = [
+    "LineName", "Bus0", "Bus1", "Bus0_Name", "Bus1_Name", 
+    "Circuit", "Conductor", "Branch_Name",
+    "Latitude_Center", "Longitude_Center", "Line_Length_km", "Azimuth_deg", "Tilt_deg",
+    "Timestamp", "AirTemp_C", "WindSpeed_mps", "WindDir_deg", "Pressure_Pa", 
+    "Humidity_percent", "CloudCover",
+    "Global_Tilted_Irradiance_Wm2",
+    "Solar_Azimuth_deg", "Solar_Elevation_deg",
+    "Effective_Solar_Irradiance_Wm2"
+]
+
+# Create CSV if it doesn't exist
+if not os.path.exists(csv_file):
+    with open(csv_file, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+# Persistent cache for NWS weather data and elevation data
+weather_cache = {}
+elevation_cache = {}
+
+# =============================================================================
+# GEOMETRY CALCULATIONS (VECTORIZED)
+# =============================================================================
+
+def calculate_line_geometry_vectorized(df_lines, df_buses):
+    """
+    Vectorized calculation of line geometry for all lines
+    """
+    # Merge bus coordinates
+    bus0_coords = df_buses[['name', 'y', 'x']].rename(columns={'name': 'bus0', 'y': 'lat0', 'x': 'lon0'})
+    bus1_coords = df_buses[['name', 'y', 'x']].rename(columns={'name': 'bus1', 'y': 'lat1', 'x': 'lon1'})
+    
+    df_merged = df_lines.merge(bus0_coords, on='bus0').merge(bus1_coords, on='bus1')
+    
+    # Calculate midpoints
+    df_merged['lat_center'] = (df_merged['lat0'] + df_merged['lat1']) / 2
+    df_merged['lon_center'] = (df_merged['lon0'] + df_merged['lon1']) / 2
+    
+    # Convert to radians for vectorized calculations
+    lat0_rad = np.radians(df_merged['lat0'])
+    lon0_rad = np.radians(df_merged['lon0'])
+    lat1_rad = np.radians(df_merged['lat1'])
+    lon1_rad = np.radians(df_merged['lon1'])
+    
+    # Vectorized line length calculation (Haversine)
+    dlat = lat1_rad - lat0_rad
+    dlon = lon1_rad - lon0_rad
+    a = np.sin(dlat/2)**2 + np.cos(lat0_rad) * np.cos(lat1_rad) * np.sin(dlon/2)**2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+    df_merged['line_length_km'] = 6371 * c
+    
+    # Vectorized azimuth calculation
+    delta_lon = lon1_rad - lon0_rad
+    x = np.sin(delta_lon) * np.cos(lat1_rad)
+    y = np.cos(lat0_rad) * np.sin(lat1_rad) - np.sin(lat0_rad) * np.cos(lat1_rad) * np.cos(delta_lon)
+    azimuth_rad = np.arctan2(x, y)
+    azimuth_deg = np.degrees(azimuth_rad)
+    
+    # Normalize to 0-360 degrees compass bearing
+    navigation_azimuth = (azimuth_deg + 360) % 360
+    # Convert to Open-Meteo's coordinate system
+    openmeteo_azimuth = (navigation_azimuth - 180) % 360
+    openmeteo_azimuth = np.where(openmeteo_azimuth > 180, openmeteo_azimuth - 360, openmeteo_azimuth)
+    
+    df_merged['azimuth_deg'] = openmeteo_azimuth
+    
+    # Vectorized tilt calculation (simplified)
+    horizontal_distance = df_merged['line_length_km'] * 1000
+    elevation_difference = np.abs(df_merged['lat0'] - df_merged['lat1']) * 111000 * 0.01
+    tilt_rad = np.arctan2(elevation_difference, horizontal_distance)
+    tilt_deg = np.degrees(tilt_rad)
+    df_merged['tilt_deg'] = np.minimum(np.abs(tilt_deg), 5.0)
+    
+    return df_merged
+
+# =============================================================================
+# ELEVATION FUNCTIONS
+# =============================================================================
+
+def get_elevation_from_api(lat, lon):
+    """Get elevation using free Open-Elevation API"""
+    try:
+        url = f"https://api.open-elevation.com/api/v1/lookup?locations={lat},{lon}"
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            elevation = data['results'][0]['elevation']
+            print(f"      Elevation for ({lat:.3f}, {lon:.3f}): {elevation}m")
+            return elevation
+        else:
+            print(f"      Elevation API error: Status {response.status_code}")
+            return 0
+    except Exception as e:
+        print(f"      Elevation API error: {e}")
+        return 0
+
+def get_elevations_vectorized(coordinates):
+    """
+    Vectorized elevation fetching with caching
+    coordinates: list of (lat, lon) tuples
+    """
+    elevations = []
+    
+    print(f"  Fetching elevations for {len(coordinates)} locations...")
+    
+    # Process all coordinates with caching
+    for i, (lat, lon) in enumerate(coordinates):
+        cache_key = f"{lat:.3f},{lon:.3f}"
+        if cache_key in elevation_cache:
+            elevations.append(elevation_cache[cache_key])
+        else:
+            elev = get_elevation_from_api(lat, lon)
+            elevation_cache[cache_key] = elev
+            elevations.append(elev)
+            
+            # Rate limiting
+            time.sleep(0.1)
+            
+        # Progress update
+        if (i + 1) % 10 == 0:
+            print(f"    Processed {i + 1}/{len(coordinates)} elevations")
+    
+    return elevations
+
+# =============================================================================
+# WEATHER DATA FUNCTIONS
+# =============================================================================
+
+def get_nws_weather_vectorized(lat, lon):
+    """Vectorized weather data fetching (single coordinate version for now)"""
+    cache_key = f"{round(lat, 3)},{round(lon, 3)}"
+    
+    if cache_key in weather_cache:
+        return weather_cache[cache_key]
+    
+    weather_data = {
+        "AirTemp_C": 25.0,  # Default fallback values
+        "WindSpeed_mps": 3.0, 
+        "WindDir_deg": 180.0,
+        "Pressure_Pa": 101325.0,
+        "Humidity_percent": 60.0,
+        "CloudCover": 0.0
+    }
+    
+    try:
+        point_url = f"https://api.weather.gov/points/{lat},{lon}"
+        point_resp = requests.get(point_url, timeout=10)
+        point_resp.raise_for_status()
+        stations_url = point_resp.json()["properties"]["observationStations"]
+
+        stations_resp = requests.get(stations_url, timeout=10)
+        stations_resp.raise_for_status()
+        stations_data = stations_resp.json()["features"]
+
+        for feature in stations_data:
+            station_id = feature["properties"]["stationIdentifier"]
+            latest_obs_url = f"https://api.weather.gov/stations/{station_id}/observations/latest"
+            
+            try:
+                obs_resp = requests.get(latest_obs_url, timeout=10)
+                obs_resp.raise_for_status()
+                obs_data = obs_resp.json()["properties"]
+
+                def safe_val(json_data, key, default=None):
+                    if (json_data.get(key) and json_data[key].get("value") is not None):
+                        return json_data[key]["value"]
+                    return default
+
+                # Extract weather parameters with defaults
+                temp = safe_val(obs_data, "temperature", 25.0)
+                wind_speed = safe_val(obs_data, "windSpeed", 3.0)
+                wind_dir = safe_val(obs_data, "windDirection", 180.0)
+                pressure = safe_val(obs_data, "barometricPressure", 101325.0)
+                humidity = safe_val(obs_data, "relativeHumidity", 60.0)
+                
+                cloud_cover = 0.0
+                if obs_data.get("cloudLayers") and len(obs_data["cloudLayers"]) > 0:
+                    cloud_cover = obs_data["cloudLayers"][0].get("amount", 0.0)
+
+                # Update with values (always have defaults)
+                weather_data["AirTemp_C"] = temp if temp is not None else 25.0
+                weather_data["WindSpeed_mps"] = wind_speed if wind_speed is not None else 3.0
+                weather_data["WindDir_deg"] = wind_dir if wind_dir is not None else 180.0
+                weather_data["Pressure_Pa"] = pressure if pressure is not None else 101325.0
+                weather_data["Humidity_percent"] = humidity if humidity is not None else 60.0
+                weather_data["CloudCover"] = cloud_cover if cloud_cover is not None else 0.0
+
+                print(f"      Weather station: {station_id}")
+                break
+                    
+            except Exception as e:
+                print(f"      Station {station_id} error: {e}")
+                continue
+
+        weather_cache[cache_key] = weather_data
+        return weather_data
+
+    except Exception as e:
+        print(f"      NWS API error: {e}")
+        # Use elevation-based fallback pressure
+        elevation = get_elevation_from_api(lat, lon)
+        fallback_pressure = 101325 * (1 - 0.0000225577 * elevation) ** 5.25588
+        weather_data["Pressure_Pa"] = fallback_pressure
+        weather_cache[cache_key] = weather_data
+        return weather_data
+
+# =============================================================================
+# SOLAR POSITION CALCULATION (VECTORIZED - FIXED)
+# =============================================================================
+
+def calculate_solar_position_vectorized(df_lines_with_geometry, timestamp, pressure_data):
+    """
+    Vectorized solar position calculation - FIXED VERSION
+    """
+    try:
+        # Get elevations for all coordinates
+        coordinates = list(zip(df_lines_with_geometry['lat_center'], df_lines_with_geometry['lon_center']))
+        elevations = get_elevations_vectorized(coordinates)
+        
+        # Convert pressure_data to numpy array and ensure it's numeric
+        pressure_array = np.array(pressure_data, dtype=float)
+        
+        # Ensure elevations is numeric
+        elevations_array = np.array(elevations, dtype=float)
+        
+        print("  Calculating solar positions...")
+        
+        # Calculate solar position for each line individually (more reliable)
+        solar_azimuths = []
+        solar_elevations = []
+        
+        for i, (lat, lon, elev, pressure) in enumerate(zip(
+            df_lines_with_geometry['lat_center'],
+            df_lines_with_geometry['lon_center'], 
+            elevations_array,
+            pressure_array
+        )):
+            try:
+                # Convert timestamp to pandas DatetimeIndex for PVLib
+                time_idx = pd.DatetimeIndex([timestamp])
+                
+                # Calculate solar position for single location
+                solar_position = pvlib.solarposition.get_solarposition(
+                    time_idx, 
+                    lat, 
+                    lon, 
+                    altitude=elev,
+                    pressure=pressure,
+                    method='nrel_numpy'
+                )
+                
+                # Extract solar angles
+                solar_azimuth = round(float(solar_position['azimuth'].iloc[0]), 1)
+                solar_elevation = round(float(solar_position['elevation'].iloc[0]), 1)
+                
+                solar_azimuths.append(solar_azimuth)
+                solar_elevations.append(solar_elevation)
+                
+            except Exception as e:
+                print(f"      Solar position error for line {i}: {e}")
+                # Fallback: calculate simple solar position
+                from pvlib import solarposition
+                simple_pos = solarposition.get_solarposition(
+                    timestamp, lat, lon, altitude=elev
+                )
+                solar_azimuths.append(round(float(simple_pos['azimuth'].iloc[0]), 1))
+                solar_elevations.append(round(float(simple_pos['elevation'].iloc[0]), 1))
+        
+        return {
+            "solar_azimuth": solar_azimuths,
+            "solar_elevation": solar_elevations,
+            "elevations": elevations
+        }
+        
+    except Exception as e:
+        print(f"      Solar position calculation error: {e}")
+        # Fallback: return default values
+        n_lines = len(df_lines_with_geometry)
+        return {
+            "solar_azimuth": [180.0] * n_lines,  # Default due south
+            "solar_elevation": [45.0] * n_lines,  # Default 45 degrees
+            "elevations": [0] * n_lines
+        }
+
+# =============================================================================
+# SOLAR IRRADIANCE FUNCTIONS (VECTORIZED)
+# =============================================================================
+
+def get_solar_irradiance_vectorized(df_lines_with_geometry):
+    """
+    Vectorized GTI and cloud cover fetching
+    """
+    try:
+        # Setup Open-Meteo API client
+        cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
+        retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+        openmeteo = openmeteo_requests.Client(session=retry_session)
+
+        results = []
+        
+        # Process in batches to avoid overwhelming the API
+        batch_size = 5
+        for i in range(0, len(df_lines_with_geometry), batch_size):
+            batch = df_lines_with_geometry.iloc[i:i + batch_size]
+            print(f"    Processing solar batch {i//batch_size + 1}/{(len(df_lines_with_geometry)-1)//batch_size + 1}")
+            
+            batch_results = []
+            for _, row in batch.iterrows():
+                try:
+                    url = "https://api.open-meteo.com/v1/forecast"
+                    params = {
+                        "latitude": row['lat_center'],
+                        "longitude": row['lon_center'],
+                        "current": [
+                            "global_tilted_irradiance_instant",  # GTI
+                            "cloud_cover"  # Total cloud cover as percentage
+                        ],
+                        "timezone": "Pacific/Honolulu",
+                        "tilt": row['tilt_deg'],
+                        "azimuth": row['azimuth_deg'],
+                    }
+                    
+                    responses = openmeteo.weather_api(url, params=params)
+                    response = responses[0]
+                    current = response.Current()
+                    
+                    gti_instant = current.Variables(0).Value()
+                    cloud_cover_percent = current.Variables(1).Value()
+                    
+                    batch_results.append({
+                        "gti": gti_instant if gti_instant is not None else 0.0,
+                        "cloud_cover": cloud_cover_percent if cloud_cover_percent is not None else 0.0
+                    })
+                    
+                except Exception as e:
+                    print(f"      Solar API error for line {row['name']}: {e}")
+                    batch_results.append({"gti": 0.0, "cloud_cover": 0.0})
+            
+            results.extend(batch_results)
+            time.sleep(1)  # Rate limiting between batches
+        
+        return results
+        
+    except Exception as e:
+        print(f"      Vectorized solar API error: {e}")
+        return [{"gti": 0.0, "cloud_cover": 0.0} for _ in range(len(df_lines_with_geometry))]
+
+def calculate_effective_irradiance_vectorized(gti_data, solar_data, line_geometry, pressure_data):
+    """
+    Vectorized effective irradiance calculation - FIXED VERSION
+    """
+    effective_irradiances = []
+    
+    for i, (gti_item, solar_az, solar_el, line_row, pressure) in enumerate(zip(
+        gti_data, solar_data["solar_azimuth"], solar_data["solar_elevation"], 
+        line_geometry.itertuples(), pressure_data
+    )):
+        try:
+            effective_irradiance = gti_item["gti"]
+            
+            # Apply cloud cover adjustment (with safe default)
+            cloud_cover = gti_item.get("cloud_cover", 0.0)
+            if cloud_cover is not None and cloud_cover > 0:
+                cloud_transmission = 1.0 - (cloud_cover / 100.0 * 0.8)
+                effective_irradiance *= max(cloud_transmission, 0.2)
+            
+            # Apply atmospheric pressure effect
+            standard_pressure = 101325.0
+            pressure_val = pressure if pressure is not None else standard_pressure
+            pressure_factor = pressure_val / standard_pressure
+            pressure_factor = max(0.95, min(1.05, pressure_factor))
+            effective_irradiance *= pressure_factor
+            
+            # Apply solar elevation effect (with safe defaults)
+            solar_el_val = solar_el if solar_el is not None else 45.0
+            if solar_el_val > 0:
+                elevation_rad = math.radians(solar_el_val)
+                elevation_factor = math.sin(elevation_rad)
+                effective_irradiance *= elevation_factor
+            
+            # Apply line orientation fine-tuning (with safe defaults)
+            solar_az_val = solar_az if solar_az is not None else 180.0
+            line_az_val = line_row.azimuth_deg if line_row.azimuth_deg is not None else 0.0
+            
+            if solar_az_val is not None and line_az_val is not None:
+                solar_az_rad = math.radians(solar_az_val)
+                line_az_rad = math.radians(line_az_val)
+                
+                azimuth_diff = abs(solar_az_rad - line_az_rad)
+                azimuth_diff = min(azimuth_diff, 2 * math.pi - azimuth_diff)
+                
+                orientation_factor = abs(math.cos(azimuth_diff))
+                effective_irradiance *= orientation_factor
+            
+            # Ensure physical limits
+            effective_irradiance = max(0.0, effective_irradiance)
+            effective_irradiance = min(effective_irradiance, 1200.0)
+            
+            effective_irradiances.append(round(effective_irradiance, 1))
+            
+        except Exception as e:
+            print(f"      Effective irradiance error for line {line_row.name}: {e}")
+            # Fallback to GTI value
+            effective_irradiances.append(round(gti_item["gti"], 1))
+    
+    return effective_irradiances
+
+# =============================================================================
+# MAIN PROCESSING (VECTORIZED - FIXED)
+# =============================================================================
+
+def process_all_transmission_lines_vectorized():
+    """
+    Vectorized processing of all transmission lines - FIXED VERSION
+    """
+    print("VECTORIZED TRANSMISSION LINE WEATHER & SOLAR DATA COLLECTOR")
+    print("=" * 60)
+    print(f"Processing {len(df_lines)} transmission lines...")
+    
+    # Clear and initialize CSV
+    with open(csv_file, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+    print(f"✓ Initialized output file: {csv_file}")
+
+    # Single consistent timestamp for all data
+    current_timestamp = datetime.now(ZoneInfo('Pacific/Honolulu'))
+    
+    # Step 1: Vectorized geometry calculation
+    print("\n1. Calculating line geometries...")
+    df_lines_with_geometry = calculate_line_geometry_vectorized(df_lines, df_buses)
+    
+    # Step 2: Vectorized weather data collection
+    print("\n2. Collecting weather data...")
+    weather_data_list = []
+    for i, (_, row) in enumerate(df_lines_with_geometry.iterrows()):
+        print(f"  Line {i+1}/{len(df_lines_with_geometry)}: {row['name']}")
+        weather_data = get_nws_weather_vectorized(row['lat_center'], row['lon_center'])
+        weather_data_list.append(weather_data)
+        time.sleep(0.5)  # Rate limiting for NWS API
+    
+    # Extract pressure data for solar calculations
+    pressure_data = [wd.get("Pressure_Pa", 101325.0) for wd in weather_data_list]
+    
+    # Step 3: Vectorized solar position calculation
+    print("\n3. Calculating solar positions...")
+    solar_data = calculate_solar_position_vectorized(
+        df_lines_with_geometry, 
+        current_timestamp, 
+        pressure_data
+    )
+    
+    # Step 4: Vectorized solar irradiance data
+    print("\n4. Collecting solar irradiance data...")
+    gti_data = get_solar_irradiance_vectorized(df_lines_with_geometry)
+    
+    # Step 5: Vectorized effective irradiance calculation
+    print("\n5. Calculating effective solar irradiance...")
+    effective_irradiances = calculate_effective_irradiance_vectorized(
+        gti_data, solar_data, df_lines_with_geometry, pressure_data
+    )
+    
+    # Step 6: Compile and save all results
+    print("\n6. Compiling results...")
+    all_rows = []
+    
+    for i, (line_row, weather, solar_az, solar_el, gti_item, eff_irrad) in enumerate(zip(
+        df_lines_with_geometry.itertuples(),
+        weather_data_list,
+        solar_data["solar_azimuth"],
+        solar_data["solar_elevation"],
+        gti_data,
+        effective_irradiances
+    )):
+        row = {
+            "LineName": line_row.name,
+            "Bus0": line_row.bus0,
+            "Bus1": line_row.bus1, 
+            "Bus0_Name": line_row.bus0_name,
+            "Bus1_Name": line_row.bus1_name,
+            "Circuit": line_row.ckt,
+            "Conductor": line_row.conductor,
+            "Branch_Name": line_row.branch_name,
+            "Latitude_Center": round(line_row.lat_center, 6),
+            "Longitude_Center": round(line_row.lon_center, 6),
+            "Line_Length_km": round(line_row.line_length_km, 3),
+            "Azimuth_deg": round(line_row.azimuth_deg, 1),
+            "Tilt_deg": round(line_row.tilt_deg, 1),
+            "Timestamp": current_timestamp.strftime('%Y-%m-%d %H:%M:%S %Z'),
+            "AirTemp_C": weather["AirTemp_C"],
+            "WindSpeed_mps": weather["WindSpeed_mps"],
+            "WindDir_deg": weather["WindDir_deg"],
+            "Pressure_Pa": weather["Pressure_Pa"],
+            "Humidity_percent": weather["Humidity_percent"],
+            "CloudCover": weather["CloudCover"],
+            "Solar_Azimuth_deg": solar_az,
+            "Solar_Elevation_deg": solar_el,
+            "Global_Tilted_Irradiance_Wm2": gti_item["gti"],
+            "Effective_Solar_Irradiance_Wm2": eff_irrad
+        }
+        all_rows.append(row)
+        
+        # Print progress for every 10 lines
+        if (i + 1) % 10 == 0:
+            print(f"  Processed {i + 1}/{len(df_lines_with_geometry)} lines")
+    
+    # Write all rows to CSV at once
+    with open(csv_file, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writerows(all_rows)
+    
+    # Print summary
+    print("\n" + "=" * 60)
+    print("VECTORIZED PROCESSING COMPLETE")
+    print(f"Successfully processed: {len(all_rows)} lines")
+    print(f"Output file: {csv_file}")
+
+if __name__ == "__main__":
+    process_all_transmission_lines_vectorized()

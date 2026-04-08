@@ -1,0 +1,122 @@
+from settings import *
+
+def update_map():
+    # Create base map
+    m = folium.Map(location=[21.47694, -157.85833], zoom_start=11)
+    
+    # Load data
+    buses_df = pd.read_csv('data/buses.csv')
+    lines_df = pd.read_csv('data/lines.csv')
+    weather_df = pd.read_csv('weather_data.csv')
+    
+    # Create bus coordinates dictionary
+    bus_coords = {}
+    for idx, row in buses_df.iterrows():
+        bus_coords[row['name']] = (row['y'], row['x'])
+    
+    # Draw lines
+    for idx, row in lines_df.iterrows():
+        bus0 = int(row['bus0'])
+        bus1 = int(row['bus1'])
+        
+        if bus0 in bus_coords and bus1 in bus_coords:
+            coords = [bus_coords[bus0], bus_coords[bus1]]
+            folium.PolyLine(locations=coords, color='black', weight=5, opacity=0.7).add_to(m)
+    
+    # Add bus markers with random colors to test updates
+    colors = ['red', 'green', 'orange']
+    
+    for idx, row in buses_df.iterrows():
+        if idx < len(weather_df):
+            weather_row = weather_df.iloc[idx]
+            temp = weather_row['air_temperature']
+            wind = weather_row['wind_speed']
+        else:
+            temp = "N/A"
+            wind = "N/A"
+        
+        # Random color for each update
+        random_color = random.choice(colors)
+        
+        folium.Circle(
+            location=[row['y'], row['x']],
+            popup=f"Bus {row['name']}: {row['BusName']}<br>Temp: {temp}°C<br>Wind: {wind} m/s<br>Color: {random_color}<br>Updated: {time.strftime('%H:%M:%S')}",
+            tooltip=f"{row['BusName']} - {random_color}",
+            radius=1000,
+            color="black",
+            weight=1,
+            fill_opacity=1,
+            fill_color=random_color
+        ).add_to(m)
+    
+    # Add auto-refresh JavaScript (6 seconds to ensure Python updates first)
+    auto_refresh_script = """
+    <script>
+        var countdown = 6;
+        var countdownElement = document.createElement('div');
+        
+        function updateCountdown() {
+            countdown--;
+            countdownElement.innerHTML = '<strong> LIVE POWER SYSTEM MAP</strong><br>' +
+                                        'Last updated: """ + time.strftime('%H:%M:%S') + """<br>' +
+                                        'Next refresh: ' + countdown + ' seconds';
+            
+            // Change background color as countdown progresses
+            if (countdown <= 2) {
+                countdownElement.style.backgroundColor = '#ffcccc';
+            } else if (countdown <= 4) {
+                countdownElement.style.backgroundColor = '#ffffcc';
+            } else {
+                countdownElement.style.backgroundColor = '#ccffcc';
+            }
+            
+            if (countdown <= 0) {
+                location.reload();
+            }
+        }
+        
+        document.addEventListener('DOMContentLoaded', function() {
+            countdownElement.style.position = 'fixed';
+            countdownElement.style.top = '10px';
+            countdownElement.style.right = '10px';
+            countdownElement.style.backgroundColor = '#ccffcc';
+            countdownElement.style.padding = '10px';
+            countdownElement.style.border = '2px solid #007cbf';
+            countdownElement.style.borderRadius = '5px';
+            countdownElement.style.zIndex = '9999';
+            countdownElement.style.fontFamily = 'Arial, sans-serif';
+            countdownElement.style.fontSize = '14px';
+            countdownElement.style.boxShadow = '0 2px 5px rgba(0,0,0,0.2)';
+            document.body.appendChild(countdownElement);
+            
+            setInterval(updateCountdown, 1000);
+        });
+    </script>
+    """
+    
+    m.get_root().html.add_child(folium.Element(auto_refresh_script))
+    
+    # Save map
+    m.save('simple_power_map.html')
+    print(f"Map updated at {time.strftime('%H:%M:%S')} - Colors changed!")
+
+# Initial map creation
+update_map()
+webbrowser.open("simple_power_map.html")
+
+# Auto-update loop (HTML will auto-refresh every 6 seconds)
+print("Map is auto-updating every 5 seconds!")
+print("Browser will auto-refresh every 6 seconds!")
+print("Circle colors will change randomly with each update")
+print("⏹Press Ctrl+C to stop")
+
+update_count = 0
+try:
+    while True:
+        time.sleep(5)  # Update HTML file every 5 seconds
+        update_count += 1
+        update_map()
+        print(f"Update #{update_count} completed at {time.strftime('%H:%M:%S')}")
+except KeyboardInterrupt:
+    print("\n Auto-refresh stopped by user.")
+    print(f"Total updates: {update_count}")

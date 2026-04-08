@@ -1,0 +1,231 @@
+from settings import *
+
+def update_map():
+    # Create base map
+    m = folium.Map(location=[21.47694, -157.85833], zoom_start=11)
+    
+    # Load data
+    buses_df = pd.read_csv('data/buses.csv')
+    lines_df = pd.read_csv('data/lines.csv')
+    # Use the comprehensive weather data CSV
+    weather_data_df = pd.read_csv('data/honolulu_all_lines_weather_comprehensive.csv')
+    line_analysis_df = pd.read_csv('data/aep_dynamic_rating_analysis_fixed.csv')
+    
+    # Create bus coordinates dictionary with simple offsets
+    bus_coords = {}
+    coord_count = {}
+    
+    for idx, row in buses_df.iterrows():
+        coord = (row['y'], row['x'])
+        
+        if coord not in coord_count:
+            coord_count[coord] = 0
+            # First bus at this coordinate - use original position
+            bus_coords[row['name']] = coord
+        else:
+            coord_count[coord] += 1
+            # Subsequent buses - apply offset
+            offset_lat = row['y'] + (coord_count[coord] * 0.00375)  # ~375 meters per bus
+            offset_lon = row['x'] + (coord_count[coord] * 0.00375)
+            bus_coords[row['name']] = (offset_lat, offset_lon)
+    
+    # Draw lines using original coordinates (not offset ones)
+    original_bus_coords = {}
+    for idx, row in buses_df.iterrows():
+        original_bus_coords[row['name']] = (row['y'], row['x'])
+    
+    # Create a mapping from line names to stress levels
+    line_stress_levels = {}
+    for idx, row in line_analysis_df.iterrows():
+        line_stress_levels[row['LineName']] = row['StressLevel']
+    
+    # Create a dictionary to track the worst stress level for each bus
+    bus_stress_levels = {}
+    
+    # First pass: Draw lines and collect bus stress information
+    for idx, row in lines_df.iterrows():
+        bus0 = int(row['bus0'])
+        bus1 = int(row['bus1'])
+        
+        if bus0 in original_bus_coords and bus1 in original_bus_coords:
+            coords = [original_bus_coords[bus0], original_bus_coords[bus1]]
+            
+            # Determine line color based on stress level
+            line_name = f"L{idx}"  # Assuming line names match the CSV (L0, L1, L2, etc.)
+            stress_level = line_stress_levels.get(line_name, "NORMAL")
+            
+            if stress_level == "NORMAL":
+                line_color = 'green'
+                stress_value = 1  # For ranking stress levels
+            elif stress_level == "HIGH":
+                line_color = 'orange'
+                stress_value = 2
+            elif stress_level == "CRITICAL":
+                line_color = 'red'
+                stress_value = 3
+            else:
+                line_color = 'gray'
+                stress_value = 0
+            
+            # Update bus stress levels with the worst case
+            for bus_id in [bus0, bus1]:
+                if bus_id not in bus_stress_levels:
+                    bus_stress_levels[bus_id] = {'stress_value': stress_value, 'stress_level': stress_level}
+                else:
+                    # Keep the highest stress value (most critical)
+                    if stress_value > bus_stress_levels[bus_id]['stress_value']:
+                        bus_stress_levels[bus_id] = {'stress_value': stress_value, 'stress_level': stress_level}
+            
+            # Add line to map
+            folium.PolyLine(
+                locations=coords, 
+                color=line_color, 
+                weight=4,
+                opacity=0.8,
+                popup=f"Line {line_name}<br>Stress Level: {stress_level}<br>Color: {line_color}"
+            ).add_to(m)
+    
+    # Create a mapping from bus IDs to weather data
+    bus_weather_data = {}
+    for idx, row in weather_data_df.iterrows():
+        bus0_id = int(row['Bus0'])
+        bus1_id = int(row['Bus1'])
+        
+        # Store weather data for both buses
+        weather_info = {
+            'air_temp': row['AirTemp_C'],
+            'wind_speed': row['WindSpeed_mps'],
+            'wind_dir': row['WindDir_deg'],
+            'pressure': row['Pressure_Pa'],
+            'humidity': row['Humidity_percent'],
+            'cloud_cover': row['CloudCover'],
+            'solar_irradiance': row['Effective_Solar_Irradiance_Wm2'],
+            'timestamp': row['Timestamp']
+        }
+        
+        bus_weather_data[bus0_id] = weather_info
+        bus_weather_data[bus1_id] = weather_info
+    
+    # Second pass: Add bus markers with colors matching their worst connected line
+    for idx, row in buses_df.iterrows():
+        bus_id = row['name']
+        
+        # Get weather data for this bus
+        weather_info = bus_weather_data.get(bus_id, {})
+        temp = weather_info.get('air_temp', 'N/A')
+        wind = weather_info.get('wind_speed', 'N/A')
+        humidity = weather_info.get('humidity', 'N/A')
+        cloud_cover = weather_info.get('cloud_cover', 'N/A')
+        solar = weather_info.get('solar_irradiance', 'N/A')
+        timestamp = weather_info.get('timestamp', 'N/A')
+        
+        # Determine bus color based on the worst stress level of connected lines
+        if bus_id in bus_stress_levels:
+            stress_info = bus_stress_levels[bus_id]
+            if stress_info['stress_level'] == "NORMAL":
+                bus_color = 'green'
+            elif stress_info['stress_level'] == "HIGH":
+                bus_color = 'orange'
+            elif stress_info['stress_level'] == "CRITICAL":
+                bus_color = 'red'
+            else:
+                bus_color = 'gray'
+        else:
+            # If no connected lines found, use gray
+            bus_color = 'gray'
+            stress_info = {'stress_level': 'UNKNOWN', 'stress_value': 0}
+        
+        # Create detailed popup with weather information
+        popup_html = f"""
+        <b>Bus {bus_id}: {row['BusName']}</b><br>
+        Voltage: {row['v_nom']}kV<br>
+        Worst Stress: {stress_info['stress_level']}<br>
+        <hr>
+        <b>Weather Data:</b><br>
+        Temperature: {temp}°C<br>
+        Wind Speed: {wind} m/s<br>
+        Humidity: {humidity}%<br>
+        Cloud Cover: {cloud_cover}<br>
+        Solar Irradiance: {solar} W/m²<br>
+        <hr>
+        Updated: {time.strftime('%H:%M:%S')}<br>
+        Data Time: {timestamp}
+        """
+        
+        folium.Circle(
+            location=bus_coords[bus_id],
+            popup=folium.Popup(popup_html, max_width=300),
+            tooltip=f"{row['BusName']} (Bus {bus_id}) - {stress_info['stress_level']}",
+            radius=300,
+            color="black",
+            weight=2,
+            fill_opacity=0.8,
+            fill_color=bus_color
+        ).add_to(m)
+    
+    # Add legend
+    legend_html = '''
+    <div style="position: fixed; 
+                top: 10px; left: 50px; width: 220px; height: 140px; 
+                background-color: white; border:2px solid grey; z-index:9999; 
+                font-size:14px; padding: 10px; border-radius: 5px;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.2);">
+        <p style="margin:0; font-weight: bold;">Power System Status</p>
+        <p style="margin:2px 0;"><span style="color:green; font-weight:bold;">●</span> Normal</p>
+        <p style="margin:2px 0;"><span style="color:orange; font-weight:bold;">●</span> High Stress</p>
+        <p style="margin:2px 0;"><span style="color:red; font-weight:bold;">●</span> Critical</p>
+        <p style="margin:2px 0;"><span style="color:gray; font-weight:bold;">●</span> Unknown</p>
+        <hr style="margin:5px 0;">
+        
+    </div>
+    '''
+    
+    m.get_root().html.add_child(folium.Element(legend_html))
+    
+    # Add auto-refresh JavaScript - changed to 5 minutes (300 seconds)
+    auto_refresh_script = """
+    <script>
+        var countdown = 300;
+        var countdownElement = document.createElement('div');
+        
+        function updateCountdown() {
+            countdown--;
+            countdownElement.innerHTML = '<strong>LIVE POWER SYSTEM MAP</strong><br>' +
+                                        'Last updated: """ + time.strftime('%H:%M:%S') + """<br>' +
+                                        'Next refresh: ' + countdown + ' seconds';
+            
+            if (countdown <= 60) {
+                countdownElement.style.backgroundColor = '#ffcccc';
+            } else if (countdown <= 120) {
+                countdownElement.style.backgroundColor = '#ffffcc';
+            } else {
+                countdownElement.style.backgroundColor = '#ccffcc';
+            }
+            
+            if (countdown <= 0) {
+                location.reload();
+            }
+        }
+        
+        document.addEventListener('DOMContentLoaded', function() {
+            countdownElement.style.position = 'fixed';
+            countdownElement.style.top = '10px';
+            countdownElement.style.right = '10px';
+            countdownElement.style.backgroundColor = '#ccffcc';
+            countdownElement.style.padding = '10px';
+            countdownElement.style.border = '2px solid #007cbf';
+            countdownElement.style.borderRadius = '5px';
+            countdownElement.style.zIndex = '9999';
+            countdownElement.style.fontFamily = 'Arial, sans-serif';
+            countdownElement.style.fontSize = '14px';
+            countdownElement.style.boxShadow = '0 2px 5px rgba(0,0,0,0.2)';
+            document.body.appendChild(countdownElement);
+            
+            setInterval(updateCountdown, 1000);
+        });
+    </script>
+    """
+    
+    m.get_root().html.add_child(folium.Element(auto_refresh_script))
+    m.save('simple_power_map.html')
+    #print(f"Map updated at {time.strftime('%H:%M:%S')}")
